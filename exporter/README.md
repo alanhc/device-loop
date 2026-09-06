@@ -193,15 +193,42 @@ unprivileged user namespace。
 - **不是這個 unit 特有的設定。** 用 `systemd-run --user` 跑同一條指令
   一樣失敗——問題出在 systemd user session 這個執行脈絡本身。
 
-一條值得追的線索:`cvd` 是 client/server,**cvd server 跑在第一個啟動它
-的 session 裡**(實測時它在 `session-8047.scope`,也就是互動 shell)。
-所以「誰先起 cvd server」會決定 crosvm 繼承到什麼脈絡,手動與服務的差別
-很可能出在這裡。
+### 已經試過而**無效**的解法
 
-可能的解法(都還沒試):把 cvd server 也做成一個 systemd user service 讓
-它有固定的脈絡、或給 exporter service 加 `Delegate=yes`、或退一步用
-`sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`(需要 root,
-而且放寬的是全系統的限制)。
+2026-09-07 用控制變因的方式測過一輪。實驗設計:同一條 `cvd create`、同一份
+環境變數(`HOME`/`PATH`/`XDG_RUNTIME_DIR` 都明確帶),只改執行脈絡。
+
+| 執行脈絡 | 結果 |
+|---|---|
+| 互動 shell 直接跑 | **成功**(Running) |
+| `systemd-run --user --scope` | **成功**(Running) |
+| `systemd-run --user`(transient service) | **失敗**(逾時,VM 建不起來) |
+| transient service + `Delegate=yes` | **失敗** |
+| **service 裡再開一個 `--scope`** | **失敗** |
+
+最後一列是關鍵:把 `cvd create` 包進 `systemd-run --user --scope` 曾經看起來
+是解法(從 shell 跑 scope 確實成功),但**從 service 裡開的 scope 一樣失敗**
+——所以那個包裝對 exporter 沒用,已經改回去了。
+
+一併排除掉的:
+
+- **不是 cgroup 位置。** 從 shell 開的 scope 與從 service 開的 scope
+  落在同一個地方(`app.slice/run-*.scope`),一個成功一個失敗。
+- **`unshare(CLONE_NEWNS) failed` 是紅鯡魚。** 這行警告在**成功的 scope
+  裡也會出現**,crosvm 照樣把 VM 建起來。而且 `unshare --mount` 在 shell、
+  scope、service 三種脈絡下**全部**被擋(`kernel.apparmor_restrict_
+  unprivileged_userns=1`),所以它不可能是區分成功與失敗的那個變因。
+- **不是 `Delegate=`、不是環境變數、不是 `loginuid`**(兩邊都是 1000)、
+  不是 `/dev/kvm` 與 `/dev/vhost-vsock` 的權限(service 裡讀得到,
+  `kvm` group 也在)。
+
+所以真正的變因是「行程有沒有掛在一個 login session 底下」這件事本身,
+而不是它跑在哪個 cgroup 或帶著什麼環境。還沒找到是哪一條具體機制。
+
+**還沒試的:** `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`
+(要 root,而且放寬的是全系統的限制);或把 exporter 從 systemd user
+service 改成掛在一個常駐 login session 底下跑(例如 `tmux` + `loginctl
+enable-linger`,但那等於放棄 systemd 的生命週期管理)。
 
 **收斂邏輯本身是對的**:失敗時 exporter 逾時、回報 failed、裝置被扣住,
 不會把一台起不來的實例交給下一個人。
