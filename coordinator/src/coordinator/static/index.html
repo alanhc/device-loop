@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>device-loop</title>
+<style>
+:root{--bg:#fbfbfa;--card:#fff;--line:#e3e2dd;--fg:#1f1f1e;--dim:#6b6a65;
+--free:#1d7a52;--leased:#8a5a12;--offline:#8a2b2b;--unreg:#5a4ab5;--accent:#2f6ba8}
+@media(prefers-color-scheme:dark){:root{--bg:#17171a;--card:#1f1f23;--line:#33333a;
+--fg:#ececea;--dim:#9a9a95;--free:#5fce9c;--leased:#e0a94b;
+--offline:#ef8a8a;--unreg:#a99cf0;--accent:#7fb3e6}}
+*{box-sizing:border-box}
+body{margin:0;padding:24px;background:var(--bg);color:var(--fg);
+font:15px/1.6 system-ui,-apple-system,"Noto Sans TC",sans-serif}
+h1{font-size:20px;font-weight:600;margin:0 0 4px}
+.sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px}
+input,button{font:inherit;padding:7px 11px;border-radius:7px;border:1px solid var(--line);
+background:var(--card);color:var(--fg)}
+button{cursor:pointer}
+button:hover:not(:disabled){border-color:var(--accent)}
+button:disabled{opacity:.4;cursor:default}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:0;overflow:hidden;margin-bottom:20px}
+.card h2{font-size:14px;font-weight:600;margin:0;padding:12px 16px;
+border-bottom:1px solid var(--line);color:var(--dim)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:12px;font-weight:500;color:var(--dim);
+padding:8px 16px;border-bottom:1px solid var(--line)}
+td{padding:10px 16px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:none}
+.chip{display:inline-block;padding:1px 9px;border-radius:20px;font-size:12px;
+font-weight:500;border:1px solid currentColor}
+.s-free{color:var(--free)}.s-leased{color:var(--leased)}
+.s-offline{color:var(--offline)}.s-unregistered{color:var(--unreg)}
+.s-maintenance{color:var(--dim)}
+code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+background:rgba(127,127,127,.12);padding:1px 5px;border-radius:4px}
+.dim{color:var(--dim);font-size:13px}
+.ev{padding:6px 16px;border-bottom:1px solid var(--line);font-size:13px;
+display:flex;gap:10px}
+.ev:last-child{border-bottom:none}
+.ev time{color:var(--dim);white-space:nowrap;font-variant-numeric:tabular-nums}
+.ev b{font-weight:500;min-width:120px}
+.err{color:var(--offline);font-size:13px;margin-left:6px}
+.wide{overflow-x:auto}
+</style>
+</head>
+<body>
+<h1>device-loop</h1>
+<div class="sub" id="sub">載入中…</div>
+
+<div class="bar">
+  <label class="dim" for="uid">你是誰</label>
+  <input id="uid" placeholder="user id" size="14">
+  <label class="dim" for="ttl">借用時長(秒)</label>
+  <input id="ttl" value="1800" size="6">
+  <span id="err" class="err"></span>
+</div>
+
+<div class="card wide">
+  <h2>裝置</h2>
+  <table>
+    <thead><tr><th>裝置</th><th>狀態</th><th>host</th><th>借用中</th>
+    <th>endpoint</th><th></th></tr></thead>
+    <tbody id="devs"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>近期事件</h2>
+  <div id="events"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const uid = $('#uid');
+uid.value = localStorage.getItem('uid') || '';
+uid.oninput = () => localStorage.setItem('uid', uid.value);
+
+const esc = s => String(s ?? '').replace(/[<>&"]/g,
+  c => ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c]));
+
+function remain(iso){
+  const s = Math.round((new Date(iso + (iso.endsWith('Z')||iso.includes('+') ? '' : 'Z')) - Date.now())/1000);
+  if (isNaN(s)) return '';
+  if (s <= 0) return '已過期';
+  if (s < 60) return s + ' 秒';
+  if (s < 3600) return Math.floor(s/60) + ' 分';
+  return Math.floor(s/3600) + ' 時 ' + Math.floor(s%3600/60) + ' 分';
+}
+
+async function act(url, body, btn){
+  $('#err').textContent = '';
+  btn.disabled = true;
+  try{
+    const r = await fetch(url, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    if(!r.ok){
+      const d = await r.json().catch(()=>({}));
+      $('#err').textContent = (d.detail || r.status + ' ' + r.statusText);
+    }
+  }catch(e){ $('#err').textContent = String(e); }
+  btn.disabled = false;
+  load();
+}
+
+function render(d){
+  const byDev = {};
+  d.leases.forEach(l => byDev[l.device_id] = l);
+  const svc = {};
+  d.services.forEach(s => (svc[s.device_id] ||= []).push(s));
+
+  $('#devs').innerHTML = d.devices.map(dev => {
+    const l = byDev[dev.id];
+    const me = uid.value.trim();
+    const eps = (svc[dev.id]||[]).map(s =>
+      `<div><span class="dim">${esc(s.service)}</span> <code>${esc(s.endpoint)}</code></div>`
+    ).join('') || (l ? '<span class="dim">啟動中…</span>' : '');
+    let action = '';
+    if (dev.state === 'free')
+      action = `<button data-act="reserve" data-dev="${esc(dev.id)}">借用</button>`;
+    else if (l && me && l.user_id === me)
+      action = `<button data-act="release" data-lease="${l.id}">歸還</button>`;
+    else if (l)
+      action = `<span class="dim">${esc(l.user_id)} 借用中</span>`;
+    return `<tr>
+      <td><code>${esc(dev.id)}</code><div class="dim">${esc(dev.class)}</div></td>
+      <td><span class="chip s-${esc(dev.state)}">${esc(dev.state)}</span></td>
+      <td class="dim">${esc(dev.host ?? '—')}</td>
+      <td>${l ? esc(l.user_id) + '<div class="dim">剩 ' + remain(l.expires_at) +
+        (l.purpose ? ' · ' + esc(l.purpose) : '') + '</div>' : '<span class="dim">—</span>'}</td>
+      <td>${eps}</td><td>${action}</td></tr>`;
+  }).join('');
+
+  $('#events').innerHTML = d.events.map(e =>
+    `<div class="ev"><time>${esc((e.created_at||'').slice(11,19))}</time>
+     <b>${esc(e.kind)}</b><span class="dim">${esc(e.device_id)}</span>
+     <span class="dim">${esc(e.actor ?? '')}</span></div>`).join('')
+    || '<div class="ev dim">尚無事件</div>';
+
+  const n = d.devices.length, free = d.devices.filter(x=>x.state==='free').length;
+  $('#sub').textContent =
+    `${n} 台裝置 · ${free} 台可借 · ${d.leases.length} 個進行中的租約 · ` +
+    `更新於 ${new Date().toLocaleTimeString()}`;
+}
+
+document.addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-act]');
+  if (!b) return;
+  const me = uid.value.trim();
+  if (!me){ $('#err').textContent = '請先填 user id'; uid.focus(); return; }
+  if (b.dataset.act === 'reserve')
+    act('/leases', {device_id:b.dataset.dev, user_id:me,
+      ttl_s:parseInt($('#ttl').value,10)||1800, purpose:'web'}, b);
+  else
+    act(`/leases/${b.dataset.lease}/release`, {user_id:me}, b);
+});
+
+async function load(){
+  try{
+    const r = await fetch('/api/overview');
+    render(await r.json());
+  }catch(e){ $('#sub').textContent = '連不上 coordinator:' + e; }
+}
+load();
+setInterval(load, 3000);
+</script>
+</body>
+</html>

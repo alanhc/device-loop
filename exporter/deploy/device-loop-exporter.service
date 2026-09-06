@@ -1,0 +1,46 @@
+[Unit]
+# device-loop 的 exporter(設計文件 §9)。
+#
+# 為什麼是 systemd 而不是 Docker:exporter 一定要釘在插著裝置的那台 host 上,
+# 而且要直接碰 /dev、USB 與本機的 nvidia-smi/tailscale。§9 明講 exporter
+# 不適合容器化排程,coordinator 才適合。
+#
+# 為什麼是 user service:這台的 linger 已經開著(logout 後仍會跑),而
+# exporter 需要的東西全都在使用者權限內——tailscale status、nvidia-smi、
+# 以及 ~/.local 底下的部署副本。不用 root 就不要用 root。
+Description=device-loop exporter (alanhc-14700)
+Documentation=https://github.com/alanhc/device-loop
+# 網路沒起來時 heartbeat 一定失敗;不是致命的(agent 會自己重試),
+# 但沒必要在開機時先失敗幾輪。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 從 ~/.local/share 的部署副本跑,不是 ~/workspace 的工作區——工作區會被
+# rebase/checkout 改動,一次 git 操作就換掉了正在服務的程式碼。跟
+# coordinator 用容器映像當快照是同一個理由。更新方式見 deploy.sh。
+WorkingDirectory=%h/.local/share/device-loop/exporter
+# **/usr/sbin 與 /sbin 不能省。** Cuttlefish 起 VM 時要用 iptables /
+# ebtables / dnsmasq / modprobe 設定網路,這些在 Ubuntu 上都住在 /usr/sbin
+# ——PATH 少了它們,`cvd create` 會失敗在
+# "failed to create a PCI root hub"(crosvm 建不起 VM),而錯誤訊息完全
+# 看不出是 PATH 的問題。互動 shell 有這兩個目錄,systemd user service
+# 預設沒有,所以只在服務裡發作:手動跑得起來、服務跑不起來。
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+Environment=EXPORTER_COORDINATOR=http://127.0.0.1:8090
+Environment=EXPORTER_HOST_ID=alanhc-14700
+ExecStart=%h/.local/bin/uv run --no-dev --frozen exporter
+
+# coordinator 重啟、網路斷線都不該讓 exporter 死掉——agent loop 自己會吞掉
+# 例外重試(它刻意不在 coordinator 不見時停掉服務,那會踢掉正在用的 client)。
+# 這裡的 Restart 是給真的掛掉的情況用的。
+Restart=always
+RestartSec=10
+# 退出時 agent 會停掉自己起的所有 daemon(§4:exporter 擁有裝置的責任),
+# 給它時間跑完 shutdown,不要直接 SIGKILL。
+KillMode=mixed
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,29 @@
+[project]
+name = "exporter"
+version = "0.1.0"
+description = "device-loop exporter: per-host agent owning physical devices"
+readme = "README.md"
+authors = [
+    { name = "Hung-Chun Tseng", email = "alan.tseng.cs@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+]
+
+[project.scripts]
+exporter = "exporter.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.19,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "coordinator",
+    "fastapi>=0.115",
+    "pytest>=8",
+]
+
+[tool.uv.sources]
+coordinator = { path = "../coordinator" }
