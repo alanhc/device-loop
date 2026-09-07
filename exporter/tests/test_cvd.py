@@ -76,6 +76,21 @@ def test_usage_stats_prompt_is_answered_up_front():
     assert argv[argv.index("--report_anonymous_usage_stats") + 1] == "n"
 
 
+def test_sandbox_is_off_by_default_so_it_runs_under_systemd():
+    """**實測出來的關鍵旗標**:crosvm 預設把每個虛擬裝置 fork 成獨立的
+    jailed 行程,而那層 minijail 在 systemd user service 裡建不起來
+    ("failed to create proxy device: Failed to configure tube")。互動
+    shell 裡不會發生——這就是「手動跑得起來、服務跑不起來」的真正原因。"""
+    assert "--enable_sandbox=false" in create_argv(SPEC, 1, "g")
+
+
+def test_sandbox_can_be_turned_back_on_per_template():
+    """關掉的是 crosvm 對 guest 的隔離。跑不受信任的 image 時要能打開,
+    所以它是 spec 的欄位而不是寫死。"""
+    argv = create_argv({**SPEC, "sandbox": True}, 1, "g")
+    assert "--enable_sandbox=true" in argv
+
+
 def test_image_paths_come_from_the_spec():
     argv = create_argv(SPEC, 1, "g")
     assert argv[argv.index("--host_path") + 1] == "/home/alanhc/cf"

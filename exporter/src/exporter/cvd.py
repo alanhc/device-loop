@@ -71,6 +71,23 @@ def create_argv(spec: dict, instance_num: int, group: str) -> list[str]:
 
     ``--report_anonymous_usage_stats=n`` 是必要的:沒給的話 cvd 會在
     terminal 問一次 y/n,而 exporter 沒有 terminal——指令會卡到逾時。
+
+    ``--enable_sandbox=false`` 是**從 systemd service 裡跑得起來的關鍵**。
+    crosvm 預設會把每個虛擬裝置 fork 成一個獨立的 jailed 行程,而那層
+    minijail 在 systemd user service 的脈絡下建不起來,症狀是:
+
+        failed to create a PCI root hub: failed to create proxy device:
+        Failed to configure tube: failed to receive packet: Connection
+        reset by peer
+
+    互動 shell 裡不會發生,所以「手動跑得起來、服務跑不起來」。實測:同一條
+    指令加上這個旗標之後,transient service 裡 exit 0 且實例 Running。
+
+    **代價要講清楚**:關掉的是 crosvm 對**guest** 的沙箱隔離——各個虛擬
+    裝置不再各自關在自己的 minijail 裡。對這個用途(自己的 farm、跑自己的
+    AOSP image、只在 tailnet 內)可以接受;如果之後要跑不受信任的 guest,
+    這個決定要重新評估。所以它是 spec 的一個欄位(``sandbox``)而不是寫死,
+    預設 false 是為了讓服務跑得起來,要打開的人明確打開。
     """
     host_path = spec.get("host_path")
     product_path = spec.get("product_path")
@@ -87,6 +104,8 @@ def create_argv(spec: dict, instance_num: int, group: str) -> list[str]:
         "--num_instances", "1",
         "--daemon",
         "--report_anonymous_usage_stats", "n",
+        # 見 docstring:預設關掉,否則從 systemd service 裡建不起 VM。
+        f"--enable_sandbox={'true' if spec.get('sandbox') else 'false'}",
     ]
     # 記憶體/CPU 由 spec 指定:一台 host 上要塞好幾台 AVD,預設值未必合適。
     if memory := spec.get("memory_mb"):
