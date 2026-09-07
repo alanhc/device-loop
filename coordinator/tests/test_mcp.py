@@ -95,7 +95,11 @@ async def test_reserve_then_adb_shell_returns_endpoint(mcp, conn):
     out = await _call(mcp, "adb_shell", device_id=DEVICE, user_id=OWNER,
                       lease_id=lease["id"])
     assert out["endpoint"] == "100.71.211.115:9001"
-    assert out["connect"] == "adb connect 100.71.211.115:9001"
+    # **不是 `adb connect`**:endpoint 是 exporter 起的 adb *server*,
+    # 不是裝置 transport——connect 對它會回 offline(真機驗證過兩次:
+    # Pixel 8 與 Cuttlefish 都是用 -H/-P 才連得上)。
+    assert out["connect"] == "adb -H 100.71.211.115 -P 9001 devices"
+    assert out["shell"] == "adb -H 100.71.211.115 -P 9001 shell"
 
 
 # 碰裝置的 tool 除了 device_id/user_id 之外還要的必填參數。授權檢查一定

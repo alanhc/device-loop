@@ -214,7 +214,7 @@ def create_mcp(
     @mcp.tool(
         description=(
             "取得該裝置的 adb 連線 endpoint。需要持有有效 lease。"
-            "回傳 host:port,client 用 `adb connect <endpoint>` 連上後直接操作。"
+            "回傳 host:port,client 用 `adb -H <host> -P <port>` 連上後直接操作。"
         )
     )
     def adb_shell(device_id: str, user_id: str, lease_id: int | None = None) -> dict[str, Any]:
@@ -227,11 +227,17 @@ def create_mcp(
             endpoint = _endpoint(device_id, "adb")
         if endpoint is None:
             raise ToolError(_pending_reason(device_id, "adb"))
+        host, _, port = endpoint.rpartition(":")
         return {
             "device_id": device_id,
             "lease_id": lease["id"],
             "endpoint": endpoint,
-            "connect": f"adb connect {endpoint}",
+            # **不是 `adb connect`。** endpoint 是一個 adb **server**
+            # (exporter 起的 --one-device server),不是裝置的 transport
+            # ——`adb connect` 對它會回 offline。要用 -H/-P 把它當 server 用。
+            # 真機驗證過的形式就是這個(Pixel 8 與 Cuttlefish 都是)。
+            "connect": f"adb -H {host} -P {port} devices",
+            "shell": f"adb -H {host} -P {port} shell",
         }
 
     @mcp.tool(
@@ -291,9 +297,13 @@ def create_mcp(
             "device_id": device_id,
             "lease_id": lease["id"],
             "endpoint": endpoint,
-            # -s 指定 adb server 上的裝置;先 connect 再跑 scrcpy。
-            "connect": f"adb connect {endpoint}",
-            "command": f"scrcpy --tcpip={host}:{port}",
+            # endpoint 是 adb **server** 而不是裝置 transport,所以 scrcpy
+            # 要靠 ADB_SERVER_SOCKET 指向它,不是 --tcpip(那是叫 scrcpy
+            # 自己去 connect 一台裝置,對 server 位址不成立)。
+            "connect": f"adb -H {host} -P {port} devices",
+            "command": (
+                f"ADB_SERVER_SOCKET=tcp:{host}:{port} scrcpy"
+            ),
             "note": "run this on your own desktop, not on the exporter host",
         }
 

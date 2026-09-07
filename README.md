@@ -703,12 +703,13 @@ camera、socat 沒轉發過真的 VNC server、也沒有真的開起來過一台
   ephemeral 的第二種 provisioner(第 12 節),跟 QEMU 池共用同一套
   template→實例機制,差別只在 exporter 那端起的是 `cvd` 而不是
   `qemu-system-*`,以及實例對外提供的是 adb 而不是 vnc(§6 明講
-  Cuttlefish 自帶 WebRTC 串流,不走 vnc)。手動跑時真的開得起來——
-  `adb` 連得上、`getprop` 回得出 Android 16——**但從 exporter 的 systemd
-  service 裡 spawn 目前會失敗**:crosvm 的 `unshare(CLONE_NEWNS)` 在
-  systemd user session 裡被擋(排除過程與可能解法見 exporter README 的
-  「已知問題」)。收斂邏輯本身是對的:失敗會被回報、裝置被扣住,不會把
-  起不來的實例交給下一個人。
+  Cuttlefish 自帶 WebRTC 串流,不走 vnc)。**整條路已在真硬體上跑通**
+  (2026-09-08):borrow template → exporter service 開出一台 AVD →
+  adb endpoint 發布到 tailnet → 遠端執行指令拿到
+  `Cuttlefish x86_64 phone` / Android 16。關鍵是 `--enable_sandbox=false`
+  ——crosvm 的 per-device minijail 在 systemd user service 裡建不起來,
+  那是「手動跑得起來、服務跑不起來」的真正原因(不是先前以為的
+  `unshare(CLONE_NEWNS)`,那行在成功的執行裡也會出現)。
 
   接這台 exporter 時發現一個設計沒涵蓋的缺口:它管的三台裝置**沒有一台
   在 USB 上**,而 Phase 1 的兩個 scanner 只掃 USB,所以它們的

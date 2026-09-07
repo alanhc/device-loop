@@ -169,7 +169,33 @@ adb port 要等實例真的生出來才知道,所以它跟 endpoint 一樣是**�
 的:實例回報 `adb_identifier`,coordinator 才據此把 adb 服務排進 desired。
 沒有這層的話 exporter 會拿實例 id 當 adb serial 去連,每輪失敗一次。
 
-### ⚠️ 已知問題:從 systemd service 裡 spawn 會失敗
+### ✅ 已解決:從 systemd service 裡 spawn(2026-09-08)
+
+**`--enable_sandbox=false`**。crosvm 預設把每個虛擬裝置 fork 成獨立的
+jailed 行程,而那層 minijail 在 systemd user service 的脈絡下建不起來:
+
+```
+failed to create a PCI root hub: failed to create proxy device:
+Failed to configure tube: failed to receive packet: Connection reset by peer
+```
+
+互動 shell 裡不會發生,所以症狀是「手動跑得起來、服務跑不起來」。加上這個
+旗標之後,exporter service 真的把一台 AVD 開起來了(Android 16、kernel
+6.12.18),endpoint 也發布到 tailnet 上、遠端連得進去執行指令。
+
+**代價**:關掉的是 crosvm 對 **guest** 的裝置隔離,不是 host 對 exporter
+的隔離。對這個用途(自己的 farm、自己的 AOSP image、只在 tailnet 內)可以
+接受。它是 template spec 的一個欄位(`sandbox`),要跑不受信任的 guest 時
+可以打開——代價是那台就得從互動 session 起。
+
+**沒有走 sysctl 那條**:`kernel.apparmor_restrict_unprivileged_userns=0`
+需要 root,而且放寬的是整台機器的限制。先量再說的結果是它**根本不是主因**
+——`unshare --mount` 在 shell 與 service 裡被擋的方式完全一樣,而 shell
+在同樣被擋的情況下開得起 VM。
+
+下面留著當初排除的過程。
+
+### (歷史)已知問題:從 systemd service 裡 spawn 會失敗
 
 **手動在互動 shell 跑 `cvd create` 成功,同一條指令從 exporter service
 裡跑會失敗。** crosvm 起不了 VM:
@@ -293,7 +319,9 @@ DTR/RTS,SBC 進 boot mode 或救磚靠的就是這些訊號腳(設計文件 §6)
 | Cuttlefish 的 `cvd fleet` 解析 | **已驗**:對真輸出解析,跑著時認得出 group,`cvd stop` 之後認不出——**後者是真機才抓到的 bug**(停掉的 group 仍留在 fleet 裡,只是 status 變 Stopped) |
 | Cuttlefish 的完整迴圈 | **已驗**(整合測試,fake 執行層):借 template → create → 回報 adb 位址 → 起 `--one-device` server → endpoint 進 DB → release → 銷毀 |
 | **多台 Cuttlefish 同時跑** | **尚未驗證**。編號分配邏輯有測試,但「10 台一起跑吃不吃得消」沒試過(一台 4GB,10 台就 40GB) |
-| **從 systemd service 裡 spawn** | **失敗中**,見上方「已知問題」:crosvm 的 `unshare(CLONE_NEWNS)` 在 systemd user session 裡被擋。手動跑得起來,服務跑不起來 |
+| **從 systemd service 裡 spawn** | **已驗**(2026-09-08):加 `--enable_sandbox=false` 之後,exporter service 真的開起一台 AVD——`cvd fleet` Running、adb endpoint 發布到 tailnet、遠端 `adb -H … -P … shell getprop` 回 `Cuttlefish x86_64 phone` / Android 16 / kernel 6.12.18 |
+| **網路 adb 裝置要明確 `adb connect`** | **已驗**(真機抓到):`--one-device` 只限定「只准這一台」,不會去接上它。少了 postflight,per-device server 起得來、endpoint 也發布得出去,但 client 看到 `offline` |
+| **endpoint 是 adb server 不是裝置 transport** | **已驗**:要用 `adb -H <host> -P <port>`,`adb connect <endpoint>` 會回 offline。MCP 的 `adb_shell` 原本給的是後者(錯的),已修 |
 | `cvd stop` 不釋放 instance number | **已驗**(真機):停掉的 group 仍佔編號,同號 create 吐 `New instance conflicts with existing instance`(exit 255)。修法是 stop 之後一定要 `cvd remove` |
 | **video(ustreamer)接真 camera** | **尚未驗證**。目前沒有對著任何裝置的 UVC camera |
 | **vnc(socat)接真上游** | **尚未驗證**。argv 形式有測試,實際轉發沒有 |
