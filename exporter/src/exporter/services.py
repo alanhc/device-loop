@@ -48,6 +48,9 @@ class ServiceSpec:
     mediated: bool = False                       # §6:flash 才是 True
     # 這種能力第一次啟動前要先跑一次的指令(見 ADB_PREFLIGHT)。
     preflight: tuple[str, ...] | None = None
+    # daemon 起來之後要對它跑的指令(見 _adb_postflight)。拿
+    # (identifier, port) 組 argv;回 None 代表這個識別碼不需要。
+    postflight: Callable[[str, int], list[str] | None] | None = None
 
 
 DEFAULT_BAUD = "9600n81"
@@ -129,8 +132,18 @@ def _vnc_argv(identifier: str, port: int) -> list[str]:
     ]
 
 
+def is_network_device(identifier: str) -> bool:
+    """這個 adb 識別碼是網路裝置(``host:port``)還是 USB serial?
+
+    Cuttlefish 實例是前者(``127.0.0.1:6520``),真 Pixel 是後者
+    (``38011FDJH00C9F``)。兩者的接法完全不同,見 ``_adb_postflight``。
+    """
+    host, sep, port = identifier.rpartition(":")
+    return bool(sep) and host != "" and port.isdigit()
+
+
 def _adb_argv(identifier: str, port: int) -> list[str]:
-    """專屬 adb server,只綁這一顆 serial。
+    """專屬 adb server,只綁這一顆裝置。
 
     ``-a`` 讓它聽在所有介面(client 要從 tailnet 連進來),``nodaemon``
     讓它留在前景由 exporter 管,``--one-device`` 是把它跟 host 上其他
@@ -140,6 +153,23 @@ def _adb_argv(identifier: str, port: int) -> list[str]:
         "adb", "-P", str(port), "--one-device", identifier,
         "server", "nodaemon", "-a",
     ]
+
+
+def _adb_postflight(identifier: str, port: int) -> list[str] | None:
+    """網路裝置要在 server 起來之後明確 ``adb connect`` 一次。
+
+    **USB 與網路裝置的差別**:USB 裝置插著就會被 server 認領,所以
+    ``--one-device <serial>`` 就夠了。網路裝置(Cuttlefish 實例是
+    ``127.0.0.1:<6520+n>``)不會自己出現——``--one-device`` 只是「限定
+    只准這一台」,不是「去把它接上」。少了這一步,per-device server
+    起得來、endpoint 也發布得出去,但 client 連進來看到的是
+    ``offline``:真機上就是這樣抓到的。
+
+    對 USB serial 回 None(不需要,而且對 serial 跑 connect 會失敗)。
+    """
+    if not is_network_device(identifier):
+        return None
+    return ["adb", "-P", str(port), "connect", identifier]
 
 
 # 一顆 USB 裝置同時只能被一個 adb server 認領。host 上的全域 server
@@ -154,7 +184,7 @@ ADB_PREFLIGHT = ("adb", "kill-server")
 
 UART = ServiceSpec(name="uart", program="ser2net", build_argv=_uart_argv)
 ADB = ServiceSpec(name="adb", program="adb", build_argv=_adb_argv,
-                  preflight=ADB_PREFLIGHT)
+                  preflight=ADB_PREFLIGHT, postflight=_adb_postflight)
 VIDEO = ServiceSpec(name="video", program="ustreamer", build_argv=_video_argv)
 VNC = ServiceSpec(name="vnc", program="socat", build_argv=_vnc_argv)
 
@@ -232,7 +262,29 @@ class ServiceManager:
             )
         svc = RunningService(device_id, service, identifier, port, handle)
         self._running[key] = svc
+        self._run_postflight(spec, identifier, port)
         return svc
+
+    def _run_postflight(self, spec: ServiceSpec, identifier: str, port: int) -> None:
+        """daemon 起來之後要做的事(網路裝置的 ``adb connect``)。
+
+        失敗不拋例外:daemon 本身已經起來了,而下一輪收斂會再跑一次
+        ——把整個服務判定為失敗反而會把它停掉重起,更糟。真正連不上的話
+        client 會看到 offline,而 endpoint 是最終一致的,這跟其他 pending
+        狀態同一類。
+        """
+        if spec.postflight is None:
+            return
+        argv = spec.postflight(identifier, port)
+        if argv is None:
+            return
+        handle = self._runner.start(argv)
+        rc = handle.wait(timeout_s=PREFLIGHT_TIMEOUT_S)
+        if rc is None:
+            handle.terminate()
+            log.warning("postflight %s timed out", " ".join(argv))
+        elif rc != 0:
+            log.warning("postflight %s exited %d", " ".join(argv), rc)
 
     def _run_preflight(self, spec: ServiceSpec) -> None:
         """每次啟動該能力前都跑一次前置指令(adb 是 kill-server)。

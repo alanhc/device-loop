@@ -375,3 +375,68 @@ def test_scrcpy_is_not_a_host_side_service(runner, ports):
     mgr = ServiceManager(runner, port_fn=ports)
     with pytest.raises(ServiceError, match="unknown service"):
         mgr.start("pixel8-shiba", "scrcpy", "38011FDJH00C9F")
+
+
+# ------------------ 網路 adb 裝置的 postflight(Cuttlefish 實例)
+# **USB 與網路裝置的接法不同**:USB 插著就會被 server 認領,網路裝置不會
+# 自己出現。`--one-device` 只是「限定只准這一台」,不是「去把它接上」。
+
+def test_a_network_device_gets_an_explicit_adb_connect(runner, ports):
+    """真機抓到的:少了這步,per-device server 起得來、endpoint 也發布得
+    出去,但 client 連進來看到的是 offline。"""
+    mgr = ServiceManager(runner, port_fn=ports)
+    mgr.start("cf-pool-0001", "adb", "127.0.0.1:6520")
+    argvs = [h.argv for h in runner.started]
+    assert ["adb", "-P", "9000", "connect", "127.0.0.1:6520"] in argvs
+
+
+def test_a_usb_serial_is_not_connected(runner, ports):
+    """對 USB serial 跑 connect 會失敗,而且它本來就不需要。"""
+    mgr = ServiceManager(runner, port_fn=ports)
+    mgr.start("pixel8-shiba", "adb", "38011FDJH00C9F")
+    assert all("connect" not in h.argv for h in runner.started)
+
+
+def test_connect_runs_after_the_server_is_up(runner, ports):
+    """順序要緊:server 還沒起來就 connect 一定失敗。"""
+    mgr = ServiceManager(runner, port_fn=ports)
+    mgr.start("cf-pool-0001", "adb", "127.0.0.1:6520")
+    argvs = [h.argv for h in runner.started]
+    server_i = next(i for i, a in enumerate(argvs) if "nodaemon" in a)
+    connect_i = next(i for i, a in enumerate(argvs) if "connect" in a)
+    assert connect_i > server_i
+
+
+def test_a_failing_connect_does_not_kill_the_service(runner, ports):
+    """daemon 已經起來了;判定整個服務失敗反而會把它停掉重起,更糟。
+    endpoint 是最終一致的,連不上跟其他 pending 狀態同一類。"""
+    class FailingConnect:
+        def __init__(self, inner):
+            self._inner = inner
+            self.started = inner.started
+
+        def start(self, argv):
+            handle = self._inner.start(argv)
+            if "connect" in argv:
+                handle.exit_code = 1
+            return handle
+
+        def which(self, program):
+            return self._inner.which(program)
+
+    mgr = ServiceManager(FailingConnect(runner), port_fn=ports)
+    svc = mgr.start("cf-pool-0001", "adb", "127.0.0.1:6520")
+    assert svc.port == 9000
+    assert mgr.running()
+
+
+@pytest.mark.parametrize("identifier,expected", [
+    ("127.0.0.1:6520", True),
+    ("100.69.80.97:6520", True),
+    ("38011FDJH00C9F", False),
+    ("/dev/serial/by-id/usb-FTDI", False),
+])
+def test_network_device_detection(identifier, expected):
+    from exporter.services import is_network_device
+
+    assert is_network_device(identifier) is expected
