@@ -34,7 +34,9 @@ benchmark)、box64 等專案的貢獻過程中,反覆需要在 QEMU VM 跟實體
 
 所有 host 之間透過 Tailscale 構成一個扁平、直接可達的 mesh network
 (`[[tigervnc-tailscale-setup]]` 已經驗證過這點),這是這份設計最重要的簡化
-前提——不需要處理 NAT 穿透或 SSH jump host。
+前提——不需要處理 NAT 穿透或 SSH jump host。這個前提不成立時的退路見第 4 節
+「沒有 overlay network 時的退路」:壞掉的只有 client 直連 exporter 那條
+data-plane,heartbeat 因為是 exporter 主動外撥而完好。
 
 ### Tailnet 盤點:每個可直連節點都是潛在的 farm 資產(2026-09-05 實掃)
 
@@ -186,7 +188,9 @@ GPU lease 的 interstitial hook 要先停這些服務再跑 benchmark,結束後�
 
 決定直接借用 Labgrid 的三層架構,但拿掉它的 `proxy`/`proxy_required`
 (SSH ProxyJump fallback)——那是為 exporter 主機在 NAT 後面、不能直接
-連線設計的,Tailscale 已經解決了這個問題,不需要這層複雜度。
+連線設計的,Tailscale 已經解決了這個問題,不需要這層複雜度。(真的失去
+overlay 時要補回來的不是這層,理由見第 4 節「沒有 overlay network 時的
+退路」。)
 
 ### NVIDIA 生態的對照:scheduler vs. lease
 
@@ -282,6 +286,66 @@ data-plane。
   coordinator。
 - **Client**:使用者或 agent。向 coordinator 要 lease,拿到 `device_services`
   裡的 endpoint 後直接連過去,不經過 coordinator 轉發資料流。
+
+### 沒有 overlay network 時的退路:exporter 反向通道
+
+第 1 節的扁平 mesh 是前提,不是保證。把 Tailscale 拿掉(換到不允許裝
+overlay 的環境、或哪天不想依賴這家 SaaS),壞掉的是**三條路徑中的一條**,
+值得先釐清是哪一條:
+
+| 路徑 | 沒有 overlay 時 | 為什麼 |
+|---|---|---|
+| Heartbeat(exporter → coordinator) | **完好** | Exporter 只主動往外撥 HTTP,出站穿 NAT 沒問題。這是選 reconcile 而非 push 的附帶好處(見第 7 節):exporter 從不開 listening port,所以從不需要被連入 |
+| Client → coordinator | 完好 | Coordinator 本來就是唯一需要有公開位址的節點 |
+| Client → exporter(data-plane) | **壞掉** | 上面虛線那條。`device_services` 回報的 `host:port` 是 exporter host 的位址,它在 NAT 後面時對 client 沒有意義 |
+
+所以要補的只有 data-plane,control-plane 一個字都不用改。
+
+**選定的作法:exporter 起服務後主動打一條反向通道到 coordinator host。**
+`ssh -R` 把本機那個 ser2net/adb port 反向轉發到 coordinator 上的一個
+port,而**回報上去的 endpoint 是 coordinator 端的那個 port**,不是本機的。
+Client 一律連 coordinator host,完全不需要知道 NAT 存在。
+
+考慮過但沒選的兩條:
+
+- **ProxyJump**(Labgrid 的 `proxy`/`proxy_required`,第 3 節拿掉的那層):
+  endpoint 多帶一個 `proxy` 欄位,client 自己 `ssh -J` 建通道。改動最小,
+  但要求**每個 client 都持有 bastion 憑證**——這跟「v1 先假設 `user_id`
+  是可信輸入」的簡化直接衝突,等於被迫提前做完第 10 節那個還沒設計的
+  認證模型。
+- **換一套自管 overlay**(headscale、WireGuard、Nebula):這是唯一讓本
+  設計一個字都不用改的選項,成本純粹轉移到營運(金鑰分發、IP 配置、
+  節點加入)。**如果動機只是拔掉對 SaaS 的依賴,應該選這條而不是反向
+  通道**——headscale 是 Tailscale 控制平面的開源實作,client 端不用換。
+  反向通道是留給「真的沒有任何 overlay 可用」的環境。
+
+選反向通道的理由是它跟現有架構的紋理一致:exporter 已經是「只往外撥、
+不開 listening port」的形狀,反向通道延續同一個假設,不需要在機會性節點
+(筆電睡醒、換網路)上新增任何可達性要求。
+
+**代價有三個,都不小:**
+
+1. **中央瓶頸回來了。** 所有 UART/adb/video/VNC 的位元組改走 coordinator
+   host。原本刻意設計成「lease 只授權、資料不經手」,現在 coordinator 的
+   頻寬與可用性變成 data-plane 的一部分。video(MJPEG 串流)跟 scrcpy
+   是最先撐不住的兩個。
+2. **Port 變成全域資源。** 現在 port 是 exporter 當下挑的 free port,
+   只有它知道(第 7 節),coordinator 無從預先決定。反向轉發之後,
+   coordinator 端的 port 會被多台 exporter 搶,得由 coordinator 配發,
+   `device_services` 要同時記本機 port 與 coordinator 端 port 兩個值。
+3. **endpoint 的最終一致性變嚴重。** 現在只要等一個 heartbeat 週期讓服務
+   起來;加了通道之後還要等通道建立,而**通道本身會斷**(網路變動、
+   sshd 重啟、機會性節點休眠)。`device_services` 不能只記 `host:port`
+   在不在,需要一個表達「通道存活」的狀態,由 exporter 在每輪 heartbeat
+   回報——沿用既有的收斂迴圈即可:通道斷了就是「少一個該跑的東西」,
+   下一輪自然重建。
+
+**實作落點**(尚未實作,無人驗證):通道的起停跟 ser2net/adb server 完全
+同構——都是「desired 裡有就起、沒有就停、把實際位址報回去」,所以歸
+`exporter/src/exporter/services.py` 的 `ServiceManager` 管,當成每個
+service 起來之後多跑一個 side-car 行程,而不是新的一層。`AutoSSH` 或
+`ssh -o ExitOnForwardFailure=yes -N -R` 都可以,重點是**行程死掉要讓
+`reap_dead()` 看得見**,否則 endpoint 會指向一條已經斷掉的通道。
 
 ## 5. 資料模型
 
